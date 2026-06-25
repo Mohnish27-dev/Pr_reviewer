@@ -18,6 +18,49 @@ export interface FixResult {
 const DEFAULT_MODEL = "claude-opus-4-8";
 
 export async function generateFix(pr: PullRequest, risks: NewRisk[]): Promise<FixResult> {
+  const bynaraKey = process.env.BYNARA_API_KEY;
+  if (bynaraKey) {
+    const model = process.env.FIXER_MODEL ?? "mimo-v2.5-pro-free";
+    try {
+      const response = await fetch("https://router.bynara.id/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${bynaraKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are an automated PR-healing agent. Given the failing checks/risks " +
+                "for a pull request, propose a concrete, minimal code fix. Reply with a " +
+                "single human-readable summary line first, then — if you can infer one — " +
+                "a fenced unified diff. Be terse and specific.",
+            },
+            { role: "user", content: buildPrompt(pr, risks) }
+          ]
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Bynara API error: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      const text = data.choices?.[0]?.message?.content?.trim() || "";
+      if (!text) return mockFix(pr, risks);
+      return { summary: firstLine(text), patch: text, model };
+    } catch (error) {
+      const fallback = mockFix(pr, risks);
+      return {
+        ...fallback,
+        summary: `Bynara unavailable (${(error as Error).message}); applied mock fix`,
+      };
+    }
+  }
+
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return mockFix(pr, risks);
 
