@@ -6,12 +6,13 @@
  * Lists existing tables, then creates `pull_requests` / `identified_risks` from
  * their JSON payloads only if missing. Safe to re-run.
  */
-
+import dotenv from "dotenv"
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createTable, lemmaConfig, listTableNames } from "../lib/lemma";
 
+dotenv.config({path:".env.local"})
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TABLES_DIR = join(HERE, "..", "lemma", "tables");
 const TABLE_NAMES = ["pull_requests", "identified_risks"] as const;
