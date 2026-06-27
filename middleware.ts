@@ -14,6 +14,7 @@ import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 
 const isPublicRoute = createRouteMatcher([
   "/", // marketing landing
+  "/model", // public landing page
   "/sign-in(.*)",
   "/sign-up(.*)",
   "/api/webhooks(.*)", // GitHub-signed; must stay open

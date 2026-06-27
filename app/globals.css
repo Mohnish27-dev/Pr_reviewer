@@ -1349,3 +1349,213 @@ body {
   .rev__work { grid-template-columns: 1fr; }
   .rev__chat { position: static; }
 }
+
+/* ============================================================================
+   LANDING V2 — scoped design tokens
+   A premium dark-modern agency layer. These variables only apply when a parent
+   wrapper carries `.landing-v2` or `[data-landing="true"]`, leaving the
+   dashboard/auth selectors above completely untouched.
+   ========================================================================== */
+
+.landing-v2,
+[data-landing="true"] {
+  /* background / surface palette ------------------------------------------ */
+  /* Light SaaS surface system — the app shell keeps its own dark :root
+     tokens; only the .landing-v2 scope flips to this light palette. */
+  --ln-bg: #f6f7fb;
+  --ln-bg-elevated: #ffffff;
+  --ln-bg-sunken: #eef0f6;
+  --ln-surface: #ffffff;
+  --ln-surface-hi: #ffffff;
+
+  --ln-line: #e4e8f0;
+  --ln-line-soft: #edf0f6;
+  --ln-line-strong: #d4dae6;
+
+  /* ink ------------------------------------------------------------------- */
+  --ln-ink: #1f2737;
+  --ln-heading: #0a0f1d;
+  --ln-muted: #5a6478;
+  --ln-faint: #8a93a8;
+  --ln-placeholder: #aab2c4;
+
+  /* accents --------------------------------------------------------------- */
+  /* Brand = violet-600. Cyan/emerald are secondary, deepened for AA on light. */
+  --ln-accent-violet: #7c3aed;
+  --ln-accent-violet-bright: #8b5cf6;
+  --ln-accent-cyan: #0891b2;
+  --ln-accent-cyan-bright: #06b6d4;
+  --ln-accent-lime: #059669;
+  --ln-accent-lime-bright: #10b981;
+
+  --ln-accent: var(--ln-accent-violet);
+  --ln-accent-bright: var(--ln-accent-violet-bright);
+  --ln-accent-glow: rgba(124, 58, 237, 0.18);
+  --ln-success: var(--ln-accent-lime);
+  --ln-success-glow: rgba(16, 185, 129, 0.20);
+
+  /* gradients ------------------------------------------------------------- */
+  --ln-hero-gradient: radial-gradient(
+      900px 520px at 82% -12%,
+      rgba(124, 58, 237, 0.10),
+      transparent 60%
+    ),
+    radial-gradient(
+      760px 480px at 10% 6%,
+      rgba(6, 182, 212, 0.08),
+      transparent 55%
+    ),
+    radial-gradient(
+      1000px 700px at 50% 118%,
+      rgba(16, 185, 129, 0.06),
+      transparent 60%
+    ),
+    var(--ln-bg);
+
+  /* typography scale ------------------------------------------------------ */
+  --ln-font-display: "Space Grotesk", "Plus Jakarta Sans", "Segoe UI",
+    system-ui, sans-serif;
+  --ln-font-body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ln-font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code",
+    monospace;
+
+  --ln-text-xs: clamp(0.72rem, 0.68rem + 0.18vw, 0.8rem);
+  --ln-text-sm: clamp(0.8rem, 0.76rem + 0.2vw, 0.9rem);
+  --ln-text-base: clamp(0.94rem, 0.9rem + 0.22vw, 1.05rem);
+  --ln-text-md: clamp(1.1rem, 1.02rem + 0.4vw, 1.35rem);
+  --ln-text-lg: clamp(1.35rem, 1.2rem + 0.75vw, 1.9rem);
+  --ln-text-xl: clamp(1.8rem, 1.5rem + 1.5vw, 3rem);
+  --ln-text-2xl: clamp(2.4rem, 1.8rem + 3vw, 4.5rem);
+  --ln-text-3xl: clamp(3rem, 2rem + 5vw, 6.5rem);
+
+  --ln-leading-tight: 1.05;
+  --ln-leading-snug: 1.2;
+  --ln-leading-normal: 1.55;
+  --ln-leading-relaxed: 1.75;
+
+  --ln-tracking-tight: -0.03em;
+  --ln-tracking-normal: 0;
+  --ln-tracking-wide: 0.08em;
+  --ln-tracking-wider: 0.18em;
+
+  /* spacing scale --------------------------------------------------------- */
+  --ln-space-1: 0.25rem;
+  --ln-space-2: 0.5rem;
+  --ln-space-3: 0.75rem;
+  --ln-space-4: 1rem;
+  --ln-space-5: 1.25rem;
+  --ln-space-6: 1.5rem;
+  --ln-space-8: 2rem;
+  --ln-space-10: 2.5rem;
+  --ln-space-12: 3rem;
+  --ln-space-16: 4rem;
+  --ln-space-20: 5rem;
+  --ln-space-24: 6rem;
+  --ln-space-32: 8rem;
+
+  /* radius / shadows ------------------------------------------------------ */
+  --ln-radius-sm: 0.5rem;
+  --ln-radius: 0.875rem;
+  --ln-radius-lg: 1.25rem;
+  --ln-radius-xl: 1.75rem;
+  --ln-radius-full: 9999px;
+
+  --ln-shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+  --ln-shadow: 0 4px 12px rgba(16, 24, 40, 0.06), 0 10px 28px rgba(16, 24, 40, 0.05);
+  --ln-shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.08), 0 24px 56px rgba(16, 24, 40, 0.06);
+  --ln-shadow-xl: 0 20px 48px rgba(16, 24, 40, 0.10), 0 32px 80px rgba(16, 24, 40, 0.08);
+
+  --ln-glow-sm: 0 0 18px var(--ln-accent-glow);
+  --ln-glow: 0 0 34px var(--ln-accent-glow);
+  --ln-glow-lg: 0 0 60px var(--ln-accent-glow);
+
+  /* motion ---------------------------------------------------------------- */
+  --ln-duration-instant: 0ms;
+  --ln-duration-fast: 120ms;
+  --ln-duration-normal: 240ms;
+  --ln-duration-slow: 500ms;
+  --ln-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ln-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ln-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* layout ---------------------------------------------------------------- */
+  --ln-page-max: 1200px;
+  --ln-page-padding: clamp(1rem, 0.5rem + 2.5vw, 2.5rem);
+  --ln-header-height: 4.5rem;
+
+  color: var(--ln-ink);
+  background: var(--ln-bg);
+}
+
+.landing-v2 *,
+[data-landing="true"] * {
+  box-sizing: border-box;
+}
+
+.landing-v2 .ln-container,
+[data-landing="true"] .ln-container {
+  width: 100%;
+  max-width: var(--ln-page-max);
+  margin-inline: auto;
+  padding-inline: var(--ln-page-padding);
+}
+
+.landing-v2 .ln-surface,
+[data-landing="true"] .ln-surface {
+  border: 1px solid var(--ln-line);
+  border-radius: var(--ln-radius-lg);
+  background: var(--ln-surface);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+.landing-v2 .ln-surface-hi,
+[data-landing="true"] .ln-surface-hi {
+  border: 1px solid var(--ln-line-strong);
+  border-radius: var(--ln-radius-lg);
+  background: var(--ln-surface-hi);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+}
+
+.landing-v2 .ln-eyebrow,
+[data-landing="true"] .ln-eyebrow {
+  font-family: var(--ln-font-mono);
+  font-size: var(--ln-text-xs);
+  letter-spacing: var(--ln-tracking-wider);
+  text-transform: uppercase;
+  color: var(--ln-accent-bright);
+}
+
+.landing-v2 .ln-display,
+[data-landing="true"] .ln-display {
+  font-family: var(--ln-font-display);
+  font-weight: 700;
+  line-height: var(--ln-leading-tight);
+  letter-spacing: var(--ln-tracking-tight);
+  color: var(--ln-heading);
+}
+
+.landing-v2 .ln-body,
+[data-landing="true"] .ln-body {
+  font-family: var(--ln-font-body);
+  font-size: var(--ln-text-base);
+  line-height: var(--ln-leading-normal);
+  color: var(--ln-muted);
+}
+
+.landing-v2 .ln-mono,
+[data-landing="true"] .ln-mono {
+  font-family: var(--ln-font-mono);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .landing-v2,
+  [data-landing="true"],
+  .landing-v2 *,
+  [data-landing="true"] * {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
