@@ -3,8 +3,8 @@
  *
  *   npx tsx scripts/lemma-setup.ts        (or: npm run lemma:setup)
  *
- * Lists existing tables, then creates `pull_requests` / `identified_risks` from
- * their JSON payloads only if missing. Safe to re-run.
+ * Lists existing tables, then creates the multi-tenant review tables from their
+ * JSON payloads only if missing. Safe to re-run. Additive: never drops tables.
  */
 import dotenv from "dotenv"
 import { readFileSync } from "node:fs";
@@ -15,7 +15,7 @@ import { createTable, lemmaConfig, listTableNames } from "../lib/lemma";
 dotenv.config({path:".env.local"})
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TABLES_DIR = join(HERE, "..", "lemma", "tables");
-const TABLE_NAMES = ["pull_requests", "identified_risks"] as const;
+const TABLE_NAMES = ["projects", "reviews", "findings", "chat_messages"] as const;
 
 async function main(): Promise<void> {
   const cfg = lemmaConfig();

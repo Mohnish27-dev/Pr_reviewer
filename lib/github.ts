@@ -1,195 +1,327 @@
 /**
- * lib/github.ts — the GitHub I/O seam (v2, Phase 1).
+ * lib/github.ts — GitHub App access layer.
  *
- * One interface, two backends — chosen by GITHUB_MODE (or auto: real when a
- * GITHUB_TOKEN is present, else mock):
- *   real  — GitHub REST API via global fetch + a fine-grained PAT (GITHUB_TOKEN).
- *   mock  — reads fixtures/sample-pr.json so a full review runs with zero setup.
+ * Auth model: a single GitHub App (App ID + private key) installs on each user's
+ * selected repos. Per request we mint a short-lived *installation* token via
+ * Octokit's `App.getInstallationOctokit`, so all repo I/O is scoped to exactly
+ * what the user granted — and writes (commits, reviews) appear as the App bot.
  *
- * ── Why this is a "seam" ──────────────────────────────────────────────────────
- * Phase 2 swaps ONLY the bodies of fetchPRContext / postPRComment to use the
- * Lemma GitHub connector (`client.connectors.operations.execute`). Callers (the
- * webhook, the /api/review route, the orchestrator) import the signatures, never
- * the implementation — so the migration touches this file alone.
+ * Everything returns plain shapes (not raw Octokit types) so the rest of the app
+ * doesn't couple to the SDK. Throws `GitHubNotConfiguredError` when the App env
+ * is absent, so callers can degrade gracefully (e.g. the simulate/demo path).
  */
 
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { ChangedFile, PRCommit, PullRequestContext } from "./types";
+import { App, Octokit } from "octokit";
 
-const GITHUB_API = "https://api.github.com";
-const HERE = dirname(fileURLToPath(import.meta.url));
-
-/** real when explicitly set, or when a token exists; otherwise mock. */
-function mode(): "real" | "mock" {
-  const explicit = (process.env.GITHUB_MODE ?? "").toLowerCase();
-  if (explicit === "real" || explicit === "mock") return explicit;
-  return process.env.GITHUB_TOKEN ? "real" : "mock";
-}
-
-function ghHeaders(accept: string): Record<string, string> {
-  const token = process.env.GITHUB_TOKEN;
-  if (!token) throw new Error("GITHUB_TOKEN is required for GITHUB_MODE=real");
-  return {
-    Authorization: `Bearer ${token}`,
-    Accept: accept,
-    "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "lemma-pr-reviewer",
-  };
-}
-
-/** Accepts "owner/name", a full PR URL, or an API URL → { owner, repo }. */
-export function parseRepo(repo: string): { owner: string; name: string } {
-  const url = repo.match(/github\.com\/([^/]+)\/([^/]+)/);
-  if (url) return { owner: url[1], name: url[2] };
-  const [owner, name] = repo.split("/");
-  if (!owner || !name) throw new Error(`Bad repo "${repo}" — expected owner/name`);
-  return { owner, name: name.replace(/\.git$/, "") };
-}
-
-/** Pull a PR number out of a github.com PR URL (for the on-demand path). */
-export function parsePrUrl(input: string): { repo: string; number: number } | null {
-  const m = input.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
-  if (!m) return null;
-  return { repo: `${m[1]}/${m[2]}`, number: Number(m[3]) };
-}
-
-async function ghJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${GITHUB_API}${path}`, {
-    headers: ghHeaders("application/vnd.github+json"),
-  });
-  if (!res.ok) {
-    throw new Error(`GitHub ${path} → ${res.status} ${res.statusText}: ${(await res.text()).slice(0, 300)}`);
+export class GitHubNotConfiguredError extends Error {
+  constructor() {
+    super(
+      "GitHub App not configured. Set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY " +
+        "(and GITHUB_WEBHOOK_SECRET) in .env.local — see README for registration.",
+    );
+    this.name = "GitHubNotConfiguredError";
   }
-  return (await res.json()) as T;
 }
 
-// ── public API (the seam) ────────────────────────────────────────────────────
+export function githubConfigured(): boolean {
+  return Boolean(process.env.GITHUB_APP_ID && process.env.GITHUB_APP_PRIVATE_KEY);
+}
 
 /**
- * Fetch the full review context for one PR: metadata + unified diff + per-file
- * patches + commit messages. The single input every reviewer agent consumes.
+ * The GitHub App installation URL. `state` round-trips back to our Setup URL so
+ * we can attribute the install to the user who started it. Null if the app slug
+ * isn't configured.
  */
-export async function fetchPRContext(repo: string, prNumber: number): Promise<PullRequestContext> {
-  if (mode() === "mock") return mockContext(repo, prNumber);
-
-  const { owner, name } = parseRepo(repo);
-  const base = `/repos/${owner}/${name}/pulls/${prNumber}`;
-
-  // Metadata is the must-have. A 404 here is the real "can't access" signal —
-  // fail with a clear, actionable message (private repo → 404 for a PAT that
-  // wasn't granted that repo).
-  let meta: GhPull;
-  try {
-    meta = await ghJson<GhPull>(base);
-  } catch (e) {
-    const msg = (e as Error).message;
-    if (msg.includes("404")) {
-      throw new Error(
-        `PR ${owner}/${name}#${prNumber} not found (404). Either it doesn't exist, ` +
-          `or your GITHUB_TOKEN can't access this repo — a fine-grained PAT only sees ` +
-          `repos you explicitly grant it (private repos return 404, not 403).`,
-      );
-    }
-    throw e;
-  }
-
-  // diff / files / commits are best-effort: a hiccup on any of these degrades the
-  // review (less context) but never drops it. Commits only feed release notes.
-  const [diff, files, commits] = await Promise.all([
-    fetch(`${GITHUB_API}${base}`, { headers: ghHeaders("application/vnd.github.v3.diff") })
-      .then((r) => (r.ok ? r.text() : ""))
-      .catch(() => ""),
-    ghJson<GhFile[]>(`${base}/files?per_page=100`).catch(() => [] as GhFile[]),
-    ghJson<GhCommit[]>(`${base}/commits?per_page=100`).catch(() => [] as GhCommit[]),
-  ]);
-
-  return {
-    repo: `${owner}/${name}`,
-    number: prNumber,
-    title: meta.title ?? "",
-    author: meta.user?.login ?? "unknown",
-    branch: meta.head?.ref ?? "",
-    baseBranch: meta.base?.ref ?? "main",
-    body: meta.body ?? "",
-    diff,
-    files: files.map(toChangedFile),
-    commits: commits.map(toCommit),
-    source: "github",
-  };
+export function appInstallUrl(state: string): string | null {
+  const slug = process.env.GITHUB_APP_SLUG;
+  if (!slug) return null;
+  const qs = new URLSearchParams({ state }).toString();
+  return `https://github.com/apps/${slug}/installations/new?${qs}`;
 }
 
-/** Post the finished review back to the PR as an issue comment. */
-export async function postPRComment(repo: string, prNumber: number, body: string): Promise<void> {
-  if (mode() === "mock") {
-    console.log(`[github:mock] would comment on ${repo}#${prNumber} (${body.length} chars)`);
-    return;
-  }
-  const { owner, name } = parseRepo(repo);
-  const res = await fetch(`${GITHUB_API}/repos/${owner}/${name}/issues/${prNumber}/comments`, {
-    method: "POST",
-    headers: { ...ghHeaders("application/vnd.github+json"), "Content-Type": "application/json" },
-    body: JSON.stringify({ body }),
+let _app: App | null = null;
+function getApp(): App {
+  if (_app) return _app;
+  if (!githubConfigured()) throw new GitHubNotConfiguredError();
+  // PEM may arrive with literal "\n" escapes (single-line .env) — normalize.
+  const privateKey = String(process.env.GITHUB_APP_PRIVATE_KEY).replace(/\\n/g, "\n");
+  _app = new App({
+    appId: String(process.env.GITHUB_APP_ID),
+    privateKey,
+    ...(process.env.GITHUB_WEBHOOK_SECRET
+      ? { webhooks: { secret: String(process.env.GITHUB_WEBHOOK_SECRET) } }
+      : {}),
   });
-  if (!res.ok) {
-    throw new Error(`GitHub comment → ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  }
+  return _app;
 }
 
-// ── mappers ──────────────────────────────────────────────────────────────────
-interface GhPull {
-  title?: string;
-  body?: string;
-  user?: { login?: string };
-  head?: { ref?: string };
-  base?: { ref?: string };
+/** An Octokit scoped to one installation (short-lived installation token). */
+export async function installationOctokit(installationId: string | number): Promise<Octokit> {
+  return getApp().getInstallationOctokit(Number(installationId));
 }
-interface GhFile {
+
+// ── shapes ──────────────────────────────────────────────────────────────────
+export interface InstallRepo {
+  id: string;
+  fullName: string; // owner/name
+  owner: string;
+  name: string;
+  defaultBranch: string;
+  private: boolean;
+}
+
+export interface PRInfo {
+  number: number;
+  title: string;
+  body: string;
+  author: string;
+  headBranch: string;
+  baseBranch: string;
+  headSha: string;
+  htmlUrl: string;
+  state: string;
+}
+
+export interface ChangedFile {
   filename: string;
-  status: string;
+  status: string; // added | modified | removed | renamed
   additions: number;
   deletions: number;
   patch?: string;
-}
-interface GhCommit {
-  sha: string;
-  commit?: { message?: string; author?: { name?: string } };
+  previousFilename?: string;
 }
 
-function toChangedFile(f: GhFile): ChangedFile {
+export interface TreeEntry {
+  path: string;
+  type: string; // blob | tree
+  size?: number;
+}
+
+function splitRepo(fullName: string): { owner: string; repo: string } {
+  const [owner, ...rest] = fullName.split("/");
+  return { owner, repo: rest.join("/") };
+}
+
+// ── installation / repo discovery ───────────────────────────────────────────
+export async function listInstallationRepos(installationId: string | number): Promise<InstallRepo[]> {
+  const octokit = await installationOctokit(installationId);
+  const repos = await octokit.paginate("GET /installation/repositories", { per_page: 100 });
+  return (repos as Array<Record<string, any>>).map((r) => ({
+    id: String(r.id),
+    fullName: r.full_name,
+    owner: r.owner?.login ?? r.full_name?.split("/")[0],
+    name: r.name,
+    defaultBranch: r.default_branch ?? "main",
+    private: Boolean(r.private),
+  }));
+}
+
+export async function getRepoBranches(
+  installationId: string | number,
+  fullName: string,
+): Promise<string[]> {
+  const octokit = await installationOctokit(installationId);
+  const { owner, repo } = splitRepo(fullName);
+  const branches = await octokit.paginate("GET /repos/{owner}/{repo}/branches", {
+    owner,
+    repo,
+    per_page: 100,
+  });
+  return (branches as Array<{ name: string }>).map((b) => b.name);
+}
+
+// ── pull request reads ──────────────────────────────────────────────────────
+export async function getPullRequest(
+  installationId: string | number,
+  fullName: string,
+  number: number,
+): Promise<PRInfo> {
+  const octokit = await installationOctokit(installationId);
+  const { owner, repo } = splitRepo(fullName);
+  const { data } = await octokit.rest.pulls.get({ owner, repo, pull_number: number });
   return {
+    number: data.number,
+    title: data.title ?? "",
+    body: data.body ?? "",
+    author: data.user?.login ?? "",
+    headBranch: data.head?.ref ?? "",
+    baseBranch: data.base?.ref ?? "",
+    headSha: data.head?.sha ?? "",
+    htmlUrl: data.html_url ?? "",
+    state: data.state ?? "open",
+  };
+}
+
+export async function getPullRequestFiles(
+  installationId: string | number,
+  fullName: string,
+  number: number,
+): Promise<ChangedFile[]> {
+  const octokit = await installationOctokit(installationId);
+  const { owner, repo } = splitRepo(fullName);
+  const files = await octokit.paginate("GET /repos/{owner}/{repo}/pulls/{pull_number}/files", {
+    owner,
+    repo,
+    pull_number: number,
+    per_page: 100,
+  });
+  return (files as Array<Record<string, any>>).map((f) => ({
     filename: f.filename,
     status: f.status,
     additions: f.additions ?? 0,
     deletions: f.deletions ?? 0,
     patch: f.patch,
-  };
-}
-function toCommit(c: GhCommit): PRCommit {
-  return {
-    sha: (c.sha ?? "").slice(0, 12),
-    message: c.commit?.message ?? "",
-    author: c.commit?.author?.name ?? "unknown",
-  };
+    previousFilename: f.previous_filename,
+  }));
 }
 
-// ── mock backend ─────────────────────────────────────────────────────────────
-function mockContext(repo: string, prNumber: number): PullRequestContext {
-  const fixture = JSON.parse(
-    readFileSync(join(HERE, "..", "fixtures", "sample-pr.json"), "utf8"),
-  ) as Partial<PullRequestContext>;
-  return {
-    repo: fixture.repo ?? repo,
-    number: fixture.number ?? prNumber,
-    title: fixture.title ?? "Sample PR",
-    author: fixture.author ?? "octocat",
-    branch: fixture.branch ?? "feature/demo",
-    baseBranch: fixture.baseBranch ?? "main",
-    body: fixture.body ?? "",
-    diff: fixture.diff ?? "",
-    files: fixture.files ?? [],
-    commits: fixture.commits ?? [],
-    source: "mock",
-  };
+/** The raw unified diff for the whole PR. */
+export async function getDiff(
+  installationId: string | number,
+  fullName: string,
+  number: number,
+): Promise<string> {
+  const octokit = await installationOctokit(installationId);
+  const { owner, repo } = splitRepo(fullName);
+  const res = await octokit.rest.pulls.get({
+    owner,
+    repo,
+    pull_number: number,
+    mediaType: { format: "diff" },
+  });
+  return res.data as unknown as string;
+}
+
+/** Full current content of a file at a ref, or null if missing/binary/dir. */
+export async function getFileContent(
+  installationId: string | number,
+  fullName: string,
+  path: string,
+  ref: string,
+): Promise<string | null> {
+  const octokit = await installationOctokit(installationId);
+  const { owner, repo } = splitRepo(fullName);
+  try {
+    const res = await octokit.rest.repos.getContent({
+      owner,
+      repo,
+      path,
+      ref,
+      mediaType: { format: "raw" },
+    });
+    return res.data as unknown as string;
+  } catch {
+    return null;
+  }
+}
+
+/** Recursive repo file tree at a ref (paths + types) — the repo map. */
+export async function getRepoTree(
+  installationId: string | number,
+  fullName: string,
+  ref: string,
+): Promise<TreeEntry[]> {
+  const octokit = await installationOctokit(installationId);
+  const { owner, repo } = splitRepo(fullName);
+  try {
+    const { data } = await octokit.rest.git.getTree({
+      owner,
+      repo,
+      tree_sha: ref,
+      recursive: "1",
+    });
+    return (data.tree ?? []).map((t) => ({
+      path: t.path ?? "",
+      type: t.type ?? "blob",
+      size: t.size,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// ── writes ──────────────────────────────────────────────────────────────────
+export interface FileEdit {
+  path: string;
+  content: string; // full new file content
+}
+
+/**
+ * Commit a set of full-file edits onto `branch` as a single atomic commit via
+ * the Git Data API (blobs → tree → commit → update ref). Returns the new SHA.
+ */
+export async function commitFiles(
+  installationId: string | number,
+  fullName: string,
+  branch: string,
+  files: FileEdit[],
+  message: string,
+): Promise<string> {
+  if (files.length === 0) throw new Error("commitFiles: no files to commit");
+  const octokit = await installationOctokit(installationId);
+  const { owner, repo } = splitRepo(fullName);
+  const refName = `heads/${branch}`;
+
+  const { data: refData } = await octokit.rest.git.getRef({ owner, repo, ref: refName });
+  const baseCommitSha = refData.object.sha;
+  const { data: baseCommit } = await octokit.rest.git.getCommit({
+    owner,
+    repo,
+    commit_sha: baseCommitSha,
+  });
+
+  const tree = await Promise.all(
+    files.map(async (f) => {
+      const { data: blob } = await octokit.rest.git.createBlob({
+        owner,
+        repo,
+        content: Buffer.from(f.content, "utf8").toString("base64"),
+        encoding: "base64",
+      });
+      return { path: f.path, mode: "100644", type: "blob", sha: blob.sha } as const;
+    }),
+  );
+
+  const { data: newTree } = await octokit.rest.git.createTree({
+    owner,
+    repo,
+    base_tree: baseCommit.tree.sha,
+    tree,
+  });
+
+  const { data: newCommit } = await octokit.rest.git.createCommit({
+    owner,
+    repo,
+    message,
+    tree: newTree.sha,
+    parents: [baseCommitSha],
+  });
+
+  await octokit.rest.git.updateRef({ owner, repo, ref: refName, sha: newCommit.sha });
+  return newCommit.sha;
+}
+
+/**
+ * Post a review with inline comments on a PR (Phase 7 — native GitHub surface).
+ * `event` maps from our flag: SAFE→APPROVE, BLOCKED/UNSAFE→REQUEST_CHANGES,
+ * else COMMENT.
+ */
+export async function postReview(
+  installationId: string | number,
+  fullName: string,
+  number: number,
+  body: string,
+  comments: Array<{ path: string; line: number; body: string }>,
+  event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+): Promise<void> {
+  const octokit = await installationOctokit(installationId);
+  const { owner, repo } = splitRepo(fullName);
+  await octokit.rest.pulls.createReview({
+    owner,
+    repo,
+    pull_number: number,
+    body,
+    event,
+    comments: comments.map((c) => ({ path: c.path, line: c.line, body: c.body })),
+  });
 }

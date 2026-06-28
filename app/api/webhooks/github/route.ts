@@ -1,24 +1,28 @@
 /**
- * POST /api/webhooks/github — inbound PR event.
+ * POST /api/webhooks/github — inbound GitHub App events.
  *
- * Verifies the GitHub HMAC signature (when GITHUB_WEBHOOK_SECRET is set),
- * upserts a `pull_requests` row, then launches the auto-healing loop
- * fire-and-forget so the HTTP response returns immediately. Loop progress is
- * observable purely through the Lemma table (the dashboard polls it).
+ * Verifies the HMAC signature, then on a `pull_request` event for a watched
+ * repo+branch: maps repo+installation → project (→ owner_id), upserts a review
+ * row, and launches the review loop fire-and-forget. Loop progress is observable
+ * purely through the Lemma tables (the dashboard polls them).
  *
- * Accepts both a real GitHub `pull_request` event payload and the simplified
- * shape that scripts/simulate-pr.ts sends.
+ * (Fire-and-forget needs a long-running host; fine for `next dev` / a Node host.)
  */
 
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
-import { fetchPRContext } from "@/lib/github";
-import { createPR } from "@/lib/lemma";
-import { runHealingLoop, runReview } from "@/lib/orchestrator";
-import type { NewPR, PullRequestContext } from "@/lib/types";
+import {
+  createReview,
+  findProjectByRepo,
+  findReviewByPr,
+  updateReview,
+} from "@/lib/lemma";
+import { runReviewLoop } from "@/lib/reviewer";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const PR_ACTIONS = new Set(["opened", "synchronize", "reopened", "ready_for_review"]);
 
 function verifySignature(secret: string, rawBody: string, signature: string | null): boolean {
   if (!signature) return false;
@@ -26,19 +30,6 @@ function verifySignature(secret: string, rawBody: string, signature: string | nu
   const a = Buffer.from(digest);
   const b = Buffer.from(signature);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-function parsePayload(body: Record<string, any>): NewPR {
-  const pr = body.pull_request ?? body;
-  const repo = body.repository?.full_name ?? body.repo ?? "demo/repo";
-  return {
-    pr_number: String(pr.number ?? body.pr_number ?? Date.now()),
-    repo,
-    branch: pr.head?.ref ?? body.branch ?? "feature/demo",
-    author: pr.user?.login ?? body.author ?? "octocat",
-    title: pr.title ?? body.title ?? "Untitled PR",
-    preview_url: body.preview_url ?? pr.preview_url ?? null,
-  };
 }
 
 export async function POST(request: Request) {
@@ -59,55 +50,75 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
 
-  // Only act on opened/synchronized/reopened PRs (real GitHub sends an `action`).
+  // Accept the real `x-github-event` header; fall back to inferring from payload
+  // (the simulate script can omit the header).
+  const event = request.headers.get("x-github-event") ?? (body.pull_request ? "pull_request" : "");
+  if (event !== "pull_request") {
+    return NextResponse.json({ ignored: event || "unknown" }, { status: 202 });
+  }
+
   const action: string | undefined = body.action;
-  if (action && !["opened", "synchronize", "reopened", "ready_for_review"].includes(action)) {
+  if (action && !PR_ACTIONS.has(action)) {
     return NextResponse.json({ ignored: action }, { status: 202 });
   }
 
-  // Start from the webhook payload, then best-effort enrich with the live PR
-  // (real diff + files + commits). A fetch failure must never drop the event.
-  let newPR: NewPR = parsePayload(body);
-  let ctx: PullRequestContext | null = null;
-  const repo = newPR.repo;
-  const number = Number(newPR.pr_number);
-  if (repo && repo !== "demo/repo" && Number.isFinite(number)) {
-    try {
-      ctx = await fetchPRContext(repo, number);
-      newPR = {
-        pr_number: String(ctx.number),
-        repo: ctx.repo,
-        branch: ctx.branch,
-        author: ctx.author,
-        title: ctx.title,
-      };
-      console.log(
-        `[webhook] enriched ${ctx.repo}#${ctx.number}: ${ctx.files.length} files, ` +
-          `${ctx.commits.length} commits, ${ctx.diff.length}-byte diff (source=${ctx.source})`,
-      );
-    } catch (error) {
-      console.warn(`[webhook] context fetch failed, using payload only: ${(error as Error).message}`);
-    }
+  const pr = body.pull_request ?? {};
+  const repo: string | undefined = body.repository?.full_name ?? body.repo;
+  const installationId: string | undefined = body.installation?.id
+    ? String(body.installation.id)
+    : body.installation_id
+      ? String(body.installation_id)
+      : undefined;
+  const prNumber = String(pr.number ?? body.pr_number ?? "");
+
+  if (!repo || !prNumber) {
+    return NextResponse.json({ error: "missing repo or pr number" }, { status: 400 });
   }
 
-  let prId: string;
+  // Map to a watching project (this resolves the owner).
+  const project = await findProjectByRepo(repo, installationId);
+  if (!project) return NextResponse.json({ ignored: "no project watching this repo" }, { status: 202 });
+  if (project.status === "PAUSED" || !project.auto_review) {
+    return NextResponse.json({ ignored: "project paused / auto-review off" }, { status: 202 });
+  }
+
+  const baseBranch = pr.base?.ref ?? body.base_branch ?? "";
+  if (project.watched_branches.length > 0 && baseBranch && !project.watched_branches.includes(baseBranch)) {
+    return NextResponse.json({ ignored: `base ${baseBranch} not watched` }, { status: 202 });
+  }
+
+  const fields = {
+    title: pr.title ?? body.title ?? "Untitled PR",
+    author: pr.user?.login ?? body.author ?? "",
+    head_branch: pr.head?.ref ?? body.head_branch ?? "",
+    base_branch: baseBranch,
+    head_sha: pr.head?.sha ?? body.head_sha ?? null,
+    html_url: pr.html_url ?? body.html_url ?? null,
+  };
+
+  let reviewId: string;
   try {
-    const pr = await createPR(newPR);
-    prId = pr.id;
+    const existing = await findReviewByPr(project.id, prNumber);
+    if (existing) {
+      await updateReview(existing.id, { ...fields, flag: "REVIEWING" });
+      reviewId = existing.id;
+    } else {
+      const review = await createReview({
+        owner_id: project.owner_id,
+        project_id: project.id,
+        repo,
+        pr_number: prNumber,
+        ...fields,
+      });
+      reviewId = review.id;
+    }
   } catch (error) {
     return NextResponse.json(
-      { error: `could not record PR: ${(error as Error).message}` },
+      { error: `could not record review: ${(error as Error).message}` },
       { status: 502 },
     );
   }
 
-  // Fire-and-forget: state is driven in the pod; the response returns now.
-  // (Caveat: serverless platforms may cut off background work — fine for
-  // `next dev` / a long-running Node host during the demo.)
-  // With a real diff in hand → review it; otherwise fall back to the v1 loop
-  // (e.g. the simulate-pr script, which sends no fetchable PR).
-  if (ctx) void runReview(prId, ctx);
-  else void runHealingLoop(prId);
-
-  return NextResponse.json({ ok: true, pr_id: prId }, { status: 202 });
+  void runReviewLoop(reviewId);
+  return NextResponse.json({ ok: true, review_id: reviewId }, { status: 202 });
 }
